@@ -79,10 +79,22 @@ static void MX_USART2_UART_Init(void);
 #define CALF_LENGTH		120 // mm
 #define PI	3.14159265f
 
+// Calibration mode sets all the servos to zero point, calibrate for legs straight out
+#define CALIBRATION_MODE	false
+
 // Leg enum for arrays etc
 enum { FRONT_LEFT, MID_LEFT, REAR_LEFT, REAR_RIGHT, MID_RIGHT, FRONT_RIGHT };
 
 enum { RED, GREEN, BLUE }; // Eye colours
+
+enum { WALK_TYPE, LEFT_X, LEFT_Y, RIGHT_X, RIGHT_Y }; // Walk type and joystick axes, as received from controller
+
+// Different walking types are sent as bitfield, first byte of command message
+#define WIGGLE_BIT		0b00000001 // Bit 0 for wiggle vs walk mode
+#define HIGH_STEP_BIT	0b00000010 // Bit 1 for normal or high step
+#define HIGH_BODY_BIT	0b00000100 // Bit 2 for normal or high body
+#define QUICK_STEP_BIT	0b00001000 // Bit 3 for normal or quick (shorter) steps
+#define RIPPLE_BIT		0b00010000 // Bit 4 to select ripple gait instead of tripod
 
 typedef struct
 {
@@ -101,22 +113,24 @@ typedef struct
 } HipLocation;
 HipLocation hipLocation[6];
 
+// A couple of legs are assembled with 2nd and 3rd servos mirrored for better cable routing
+float directions[19] = { 0, 1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1, 1, 1, 1, -1, -1 };
+
+float calibrations[19] = { 0, -4, 1, 9, -4, 2, 14, -1, -3, 8, -2, -4, 12, -3, 0, 11, 1, 0, 6 };
+
 typedef struct
 {
 	float minAngle;
 	float maxAngle;
-	float calibration;
-} ServoInfo;
-ServoInfo servo[19]; // 19 because servo IDs start from 1; 0 will be unused
+} ServoLimits;
+ServoLimits servo[19]; // 19 because servo IDs start from 1; 0 will be unused
 
-uint8_t Rx_data[10];  //  creating a buffer of 10 bytes
-uint8_t keyPressed = false;
+uint8_t rxData[10];  //  creating a buffer of 10 bytes
+uint8_t charReceived = 0;
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-	keyPressed = true;
-	HAL_UART_Receive_IT(huart, Rx_data, 1);
-}
+uint8_t controller[5] = { 0, 128, 128, 128, 128 }; // Initialise with default walk mode and middle joystick axes
+uint8_t controllerUpdate[6] = { 0, 0, 0, 0, 0, 0 }; // Cache and verify checksum before updating values above
+int8_t cIndex = -1;
 
 void SetEyeColour(char colour)
 {
@@ -131,6 +145,33 @@ void SetEyeColour(char colour)
 		HAL_GPIO_WritePin(GPIOA, EYES_B_Pin, GPIO_PIN_SET);
 }
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (rxData[0] == 'c' && cIndex < 0) // Start of controller message
+	{
+		cIndex = 0;
+	}
+	else if (cIndex >= 0)
+	{
+		controllerUpdate[cIndex] = rxData[0];
+		if (cIndex == 5) // Just wrote checksum to array
+		{
+			if ((uint8_t)(controllerUpdate[0] + controllerUpdate[1] + controllerUpdate[2] + controllerUpdate[3] + controllerUpdate[4]) == controllerUpdate[5])
+				for (int n=0; n<5; n++)
+					controller[n] = controllerUpdate[n];
+			cIndex = -1;
+		}
+		else
+			cIndex++;
+	}
+	else
+		charReceived = rxData[0];
+
+	HAL_UART_Receive_IT(huart, rxData, 1);
+}
+
+
+
 float DegreesToRadians(float angle)
 {
 	return angle*PI/180.0f;
@@ -141,11 +182,10 @@ float RadiansToDegrees(float angle)
 	return angle*180.0f/PI;
 }
 
-void SetServoLimits(uint8_t id, float minAngle, float maxAngle, float calibration)
+void SetServoLimits(uint8_t id, float minAngle, float maxAngle)
 {
 	servo[id].minAngle = minAngle;
 	servo[id].maxAngle = maxAngle;
-	servo[id].calibration = calibration;
 }
 
 void SetHipLocation(uint8_t leg, float x, float y, float z, float yaw)
@@ -203,9 +243,9 @@ char MoveServo(uint8_t id, float angle, uint16_t speed)
 {
 	if (angle < servo[id].minAngle) angle = servo[id].minAngle;
 	if (angle > servo[id].maxAngle) angle = servo[id].maxAngle;
-	angle += servo[id].calibration;
+	angle += calibrations[id];
 
-	uint16_t position = (uint16_t)(2048.0f + angle / 90.0f * 1024.0f); // Servos do 90 degrees per 1024 resolution counts
+	uint16_t position = (uint16_t)(2048.0f + angle / 90.0f * 1024.0f * directions[id]); // Servos do 90 degrees per 1024 resolution counts
 	// Speed is steps per second, about 3000 maximum for LS servo, 6000 for HS servo, use 0 for maximum
 
 	uint8_t data[6];
@@ -251,19 +291,20 @@ void MoveLeg(uint8_t leg, Point target) // leg is enum 0-5, target is absolute c
 	float hipAngle = angleOfElevationToFoot + insideAngle;
 	float kneeAngle = PI - acosf((THIGH_LENGTH*THIGH_LENGTH + CALF_LENGTH*CALF_LENGTH - linearDistanceToFoot*linearDistanceToFoot) / (2*THIGH_LENGTH*CALF_LENGTH));
 
-	// Two of the legs are assembled mirrored due to cable exit side swapping
-	if (leg == REAR_LEFT || leg == FRONT_RIGHT)
-	{
-		hipAngle *= -1;
-		kneeAngle *= -1;
-	}
-
 	// Send angles to servos
 	MoveServo(leg*3+1, RadiansToDegrees(yaw), 0);
 	MoveServo(leg*3+2, -RadiansToDegrees(hipAngle), 0); // Positive angles for hip bend down?
 	MoveServo(leg*3+3, -RadiansToDegrees(kneeAngle), 0); // Positive angles for knee bend up?
 
 }
+
+float ScaleJoystickValues(uint8_t axis)
+{
+	float scaled = ((float)(controller[axis])-128.0f)*0.78f; // converts 0-255 to -100 to 100
+	if (scaled < 10.0f && scaled > -10.0f) scaled = 0; // 10% deadband
+	return scaled;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -305,13 +346,15 @@ int main(void)
   /* USER CODE BEGIN WHILE */
 
   //HAL_UART_RegisterCallback(&huart1, HAL_UART_RX_COMPLETE_CB_ID, HAL_UART_RxCpltCallback);
-  HAL_UART_Receive_IT(&huart1, Rx_data, 1);
+  HAL_UART_Receive_IT(&huart1, rxData, 1);
 
 
-  // TODO: Add all other servos. Most will be the same except rear left and front right have reversed knee limits? And reversed calibration probably
-  SetServoLimits(1, -35, 35, -4);
-  SetServoLimits(2, -35, 35, 1);
-  SetServoLimits(3, -120, 20, 9);
+  for (int n=0; n<6; n++)
+  {
+	  SetServoLimits(1+3*n, -35, 35);
+	  SetServoLimits(2+3*n, -35, 35);
+	  SetServoLimits(3+3*n, -120, 20);
+  }
 
   SetHipLocation(FRONT_LEFT, -60, 0, 58, -60);
   SetHipLocation(MID_LEFT, -75, 0, 0, -90);
@@ -320,7 +363,7 @@ int main(void)
   SetHipLocation(MID_RIGHT, 75, 0, 0, 90);
   SetHipLocation(FRONT_RIGHT, 60, 0, 58, 60);
 
-  int servoAngle = 0;
+  int servoAngle[19] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
   int servoID = 1;
 
@@ -333,128 +376,249 @@ int main(void)
   float strideLengthX = 0;
   float strideLengthZ = 0;
   float rotationRate = 0;
+  float bodyPitch = 0;
   float rideHeight = 80;
 
   float targetStrideLengthX = 0;
   float targetStrideLengthZ = 0;
   float targetRotationRate = 0;
+  float targetBodyPitch = 0;
+
+  float wigglePitch = 0;
+  float wiggleRoll = 0;
+  float wiggleYaw = 0;
+  float wiggleHeight = rideHeight;
 
   HAL_GPIO_WritePin(GPIOC, SERVO_EN_Pin, GPIO_PIN_SET); // Enable servos
+  SetEyeColour(GREEN);
 
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
-	  //unsigned char buffer[] = "Hello\r\n";
-	  //HAL_UART_Transmit(&huart1, buffer, sizeof(buffer), HAL_MAX_DELAY);
-	  //HAL_UART_Transmit_IT(&huart1, buffer, sizeof(buffer)); // Non-blocking TX, returns HAL_OK if OK or HAL_BUSY if busy TXing
-	  //HAL_Delay(500);
-	  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
-	  //HAL_Delay(500);
 
-	  if (keyPressed)
+	  if (charReceived)
 	  {
-		  keyPressed = false;
+		  if (charReceived == 'r') SetEyeColour(RED);
+		  if (charReceived == 'g') SetEyeColour(GREEN);
+		  if (charReceived == 'b') SetEyeColour(BLUE);
 
-		  if (Rx_data[0] == 'r') SetEyeColour(RED);
-		  if (Rx_data[0] == 'g') SetEyeColour(GREEN);
-		  if (Rx_data[0] == 'b') SetEyeColour(BLUE);
-
-		  if (Rx_data[0] == 'a' || Rx_data[0] == 's')
+		  if (CALIBRATION_MODE)
 		  {
-			  if (Rx_data[0] == 'a') servoAngle -= 1;
-			  if (Rx_data[0] == 's') servoAngle += 1;
+			  if (charReceived == 'a' || charReceived == 's')
+			  {
+				  if (charReceived == 'a') servoAngle[servoID] -= 1;
+				  if (charReceived == 's') servoAngle[servoID] += 1;
 
-			  MoveServo(servoID, servoAngle, 0);
+				  //MoveServo(servoID, servoAngle, 0);
 
-			  sprintf(txBuffer, "ID %d, Angle = %d\r\n", servoID, servoAngle);
-			  HAL_UART_Transmit(&huart1, (uint8_t*)txBuffer, strlen(txBuffer), HAL_MAX_DELAY);
+				  sprintf(txBuffer, "ID %d, Angle = %d\r\n", servoID, servoAngle[servoID]);
+				  HAL_UART_Transmit(&huart1, (uint8_t*)txBuffer, strlen(txBuffer), HAL_MAX_DELAY);
 
-			  if (!MoveServo(servoID, servoAngle, 0))
-				  HAL_UART_Transmit(&huart1, (uint8_t*)failMsg, strlen(failMsg), HAL_MAX_DELAY);
+				  if (!MoveServo(servoID, servoAngle[servoID], 0))
+					  HAL_UART_Transmit(&huart1, (uint8_t*)failMsg, strlen(failMsg), HAL_MAX_DELAY);
+			  }
+			  else if (charReceived == '-' || charReceived == '=')
+			  {
+				  if (charReceived == '-' && servoID > 1) servoID--;
+				  if (charReceived == '=' && servoID < 18) servoID++;
+				  sprintf(txBuffer, "Selected servo %d\r\n", servoID);
+				  HAL_UART_Transmit(&huart1, (uint8_t*)txBuffer, strlen(txBuffer), HAL_MAX_DELAY);
+			  }
 		  }
 
-		  /*
-		  if (Rx_data[0] == '-' || Rx_data[0] == '=')
-		  {
-			  if (Rx_data[0] == '-' && servoID > 1) servoID -= 1;
-			  if (Rx_data[0] == '=' && servoID < 255) servoID += 1;
-			  sprintf(txBuffer, "Servo ID: %d\r\n", servoID);
-			  HAL_UART_Transmit(&huart1, (uint8_t*)txBuffer, strlen(txBuffer), HAL_MAX_DELAY);
-		  }*/
-		  if (Rx_data[0] == '-' || Rx_data[0] == '=')
-		  {
-			  if (Rx_data[0] == '-') targetRotationRate -= 10;
-			  if (Rx_data[0] == '=') targetRotationRate += 10;
-			  sprintf(txBuffer, "Rotation rate: %d deg/s\r\n", (int)targetRotationRate);
-			  HAL_UART_Transmit(&huart1, (uint8_t*)txBuffer, strlen(txBuffer), HAL_MAX_DELAY);
-		  }
+		  charReceived = 0;
+	  }
+
+	  if (controller[WALK_TYPE] & WIGGLE_BIT)
+	  {
+		  wigglePitch = ScaleJoystickValues(LEFT_Y)*0.2f; // ±20deg
+		  wiggleRoll = ScaleJoystickValues(LEFT_X)*0.2f;
+		  wiggleYaw = ScaleJoystickValues(RIGHT_X)*0.2f;
+		  wiggleHeight = 100.0f+ScaleJoystickValues(RIGHT_Y)*0.5f;
+	  }
+	  else if (!CALIBRATION_MODE)
+	  {
+		  targetStrideLengthX = ScaleJoystickValues(LEFT_X);
+		  targetStrideLengthZ = ScaleJoystickValues(LEFT_Y);
+		  targetRotationRate = ScaleJoystickValues(RIGHT_X)*0.7f; // This one was a bit strong, needed to scale down somewhat
+		  targetBodyPitch = ScaleJoystickValues(RIGHT_Y) *0.2f; // ±20 degrees
 	  }
 
 	  uint32_t now = HAL_GetTick();
-	  if (now > lastTick+30)
+	  int pollingRate = 20; // Milliseconds per update
+	  if (CALIBRATION_MODE) pollingRate = 200; // 5Hz
+	  if (now > lastTick+pollingRate)
 	  {
-		  lastTick += 30;
+		  lastTick += pollingRate;
 
-		  // Ramps for stride length
-		  float rampRate = 1.0f; // Interplays with polling rate of course
-		  if (targetStrideLengthZ > strideLengthZ) strideLengthZ += rampRate;
-		  if (targetStrideLengthZ < strideLengthZ) strideLengthZ -= rampRate;
-		  if (targetStrideLengthX > strideLengthX) strideLengthX += rampRate;
-		  if (targetStrideLengthX < strideLengthX) strideLengthX -= rampRate;
-		  if (targetRotationRate < rotationRate) rotationRate -= rampRate;
-		  if (targetRotationRate > rotationRate) rotationRate += rampRate;
+		  //if (now > lastTick + pollingRate) // ERROR: Main loop not keeping up!
+			//  SetEyeColour(RED);
 
-
-		  float legLiftHeight = sqrtf(strideLengthX*strideLengthX+strideLengthZ*strideLengthZ+rotationRate*rotationRate);
-		  if (legLiftHeight > 40) legLiftHeight = 40;
-
-		  float targetHeight = 60; // Squat when not moving
-		  if (legLiftHeight > 1) targetHeight = 100;
-		  if (targetHeight > rideHeight) rideHeight += 2;
-		  if (targetHeight < rideHeight) rideHeight -= 2;
-
-
-		  strideTimer += 0.02f;
-		  if (strideTimer > 1) strideTimer -= 1;
-
-		  //for (int leg = FRONT_LEFT; leg <= FRONT_RIGHT; leg++)
-		  //{
-			  float t = strideTimer;
-			  //if (leg == MID_LEFT || leg == REAR_RIGHT || leg == FRONT_RIGHT)
-			  //	  t = strideTimer + 0.5f; // Half the legs are opposite phase
-			  //if (t > 1.0f) t -= 1.0f;
-
-			  Point target;
-			  float rotation;
-			  if (t < 0.5f) // Horizontal drag part of gait
+		  if (CALIBRATION_MODE)
+		  {
+			  for (int id=1; id<=18; id++)
+				  if (!MoveServo(id, servoAngle[id], 0))
+					  HAL_UART_Transmit(&huart1, (uint8_t*)failMsg, strlen(failMsg), HAL_MAX_DELAY);
+		  }
+		  else if (controller[WALK_TYPE] & WIGGLE_BIT)
+		  {
+			  for (int leg = FRONT_LEFT; leg <= FRONT_RIGHT; leg++)
 			  {
-				  target.x = footNeutralPoint[FRONT_LEFT].x + strideLengthX * (0.5f - t*2.0f);
-				  target.y = -rideHeight;
-				  target.z = footNeutralPoint[FRONT_LEFT].z + strideLengthZ * (0.5f - t*2.0f);
-				  rotation = DegreesToRadians((-0.5f+(t-0.5f)*2.0f)*rotationRate)*0.25f;
-				  // The 0.25 gets it into similar units as strides, e.g 100 rotation rate -> ~100mm steps
+				  Point target;
+				  float tempX = footNeutralPoint[leg].x;
+				  float tempY = -wiggleHeight;
+				  float tempZ = footNeutralPoint[leg].z;
+
+				  float pitch = DegreesToRadians(wigglePitch);
+				  float roll = DegreesToRadians(wiggleRoll);
+				  float yaw = DegreesToRadians(wiggleYaw);
+
+				  // Pitch, affects Y and Z
+				  float tempY2 = tempY * cosf(pitch) - tempZ * sinf(pitch);
+				  float tempZ2 = tempY * sinf(pitch) + tempZ * cosf(pitch);
+
+				  // Roll, affects X and Y
+				  float tempX2 = tempX * cosf(roll) - tempY2 * sinf(roll);
+				  target.y = tempX * sinf(roll) + tempY2 * cosf(roll);
+
+				  // Yaw, affects X and Z
+				  target.x = tempX2 * cosf(yaw) - tempZ2 * sinf(yaw);
+				  target.z = tempX2 * sinf(yaw) + tempZ2 * cosf(yaw);
+
+				  MoveLeg(leg, target);
 			  }
-			  else // Return arc
+		  }
+		  else
+		  {
+			  // Ramps for stride length
+			  float rampRate = 2.0f; // Interplays with polling rate of course
+			  if (targetStrideLengthZ > strideLengthZ) strideLengthZ += rampRate;
+			  if (targetStrideLengthZ < strideLengthZ) strideLengthZ -= rampRate;
+			  if (targetStrideLengthX > strideLengthX) strideLengthX += rampRate;
+			  if (targetStrideLengthX < strideLengthX) strideLengthX -= rampRate;
+			  if (targetRotationRate < rotationRate) rotationRate -= rampRate;
+			  if (targetRotationRate > rotationRate) rotationRate += rampRate;
+			  if (targetBodyPitch < bodyPitch) bodyPitch -= rampRate;
+			  if (targetBodyPitch > bodyPitch) bodyPitch += rampRate;
+
+
+			  float legLiftHeight = sqrtf(strideLengthX*strideLengthX+strideLengthZ*strideLengthZ+rotationRate*rotationRate);
+			  if (legLiftHeight > 50) legLiftHeight = 50;
+
+			  if (controller[WALK_TYPE] & HIGH_STEP_BIT) legLiftHeight *= 2.0f;
+
+			  // Approximation of total stride length, which we'll use to limit angles
+			  float totalStrideLength = sqrtf(strideLengthX*strideLengthX+strideLengthZ*strideLengthZ) + fabs(rotationRate); // Rotation needed a bit extra
+			  float scalingFactor = 1;
+			  if (totalStrideLength > 100.0f)
+				  scalingFactor = 100.0f / totalStrideLength;
+
+			  float targetHeight = 60; // Squat when not moving
+			  if (controller[WALK_TYPE] & HIGH_BODY_BIT)
+				  targetHeight = 150;
+			  else if (legLiftHeight > 1) targetHeight = 100;
+			  if (targetHeight > rideHeight) rideHeight += 2;
+			  if (targetHeight < rideHeight) rideHeight -= 2;
+
+			  float cadence = 2.0f - 0.01f*totalStrideLength*scalingFactor; // So, 2.0s for shortest steps, 1s for long steps
+
+			  if (controller[WALK_TYPE] & QUICK_STEP_BIT)
 			  {
-				  float angle = PI * (t-0.5f)*2.0f; // strideTimer of 0.5-1.0 converted to 0-PI radians
-				  target.x = footNeutralPoint[FRONT_LEFT].x - strideLengthX * 0.5f * cosf(angle);
-				  target.y = -rideHeight + legLiftHeight * sinf(angle);
-				  target.z = footNeutralPoint[FRONT_LEFT].z - strideLengthZ * 0.5f * cosf(angle);
-				  rotation = DegreesToRadians((0.5f - t*2.0f)*rotationRate)*0.25f;
+				  scalingFactor *= 0.5f; // Shorter steps
+				  cadence *= 0.5f; // Faster steps
 			  }
 
-			  // Add rotation offsets about body centre, in sync with steps, matrix is [ cos(θ) −sin(θ) | sin(θ) cos(θ) ]
-			  // Want similar units - degrees per second is about right?
-			  float tempX = target.x;
-			  float tempZ = target.z;
-			  target.x = tempX * cosf(rotation) - tempZ * sinf(rotation);
-			  target.z = tempX * sinf(rotation) + tempZ * cosf(rotation);
+			  strideTimer += (float)pollingRate/1000.0f/cadence;
+			  if (strideTimer > 1) strideTimer -= 1;
 
-			  MoveLeg(FRONT_LEFT, target);
-		  //}
+			  for (int leg = FRONT_LEFT; leg <= FRONT_RIGHT; leg++)
+			  {
+
+				  Point target;
+				  float rotation;
+				  if (controller[WALK_TYPE] & RIPPLE_BIT)
+				  {
+					  // Ripple gait: Each leg 1/6th out of phase with others
+					  // Sequence is rear left, front right, mid left, rear right, front left, mid right
+					  // Each leg on ground 2/3rds of the time, quick semicircle return after
+					  float t = strideTimer;
+					  if (leg == REAR_LEFT) t += 0.833f; // Most advanced in gait sequence
+					  if (leg == FRONT_RIGHT) t += 0.667;
+					  if (leg == MID_LEFT) t += 0.5f;
+					  if (leg == REAR_RIGHT) t += 0.333f;
+					  if (leg == FRONT_LEFT) t += 0.167f;
+					  // MID_RIGHT is last in sequence, no change
+
+					  if (t > 1.0f) t -= 1.0f;
+
+					  if (t < 0.6666f) // Horizontal drag part of gait
+					  {
+						  t *= 0.75f; // Convert to 0-0.5 range so it works with the normal gait algorithm
+
+						  target.x = footNeutralPoint[leg].x + strideLengthX * scalingFactor * (0.5f - t*2.0f);
+						  target.y = -rideHeight;
+						  target.z = footNeutralPoint[leg].z + strideLengthZ * scalingFactor * (0.5f - t*2.0f);
+						  rotation = DegreesToRadians((-0.5f+t*2.0f)*rotationRate)*0.25f;
+						  // The 0.25 gets it into similar units as strides, e.g 100 rotation rate -> ~100mm steps
+					  }
+					  else // Return arc
+					  {
+						  // Convert t from 0.666-1.0 range into 0.5-1.0 so it works with normal gait algorithm
+						  t = 0.5f + (t-0.6666f)*1.5f;
+
+						  float angle = PI * (t-0.5f)*2.0f; // strideTimer of 0.5-1.0 converted to 0-PI radians
+						  target.x = footNeutralPoint[leg].x - strideLengthX * scalingFactor * 0.5f * cosf(angle);
+						  target.y = -rideHeight + legLiftHeight * sinf(angle);
+						  target.z = footNeutralPoint[leg].z - strideLengthZ * scalingFactor * 0.5f * cosf(angle);
+						  rotation = DegreesToRadians((0.5f - (t-0.5f)*2.0f)*rotationRate * scalingFactor)*0.25f;
+					  }
+				  }
+				  else
+				  {
+					  // Tripod gait: Each foot down for 50% of the time, alternating flat drag then semicircle return
+					  float t = strideTimer;
+					  if (leg == MID_LEFT || leg == REAR_RIGHT || leg == FRONT_RIGHT)
+						  t = strideTimer + 0.5f; // Half the legs are opposite phase
+					  if (t > 1.0f) t -= 1.0f;
+
+					  if (t < 0.5f) // Horizontal drag part of gait
+					  {
+						  target.x = footNeutralPoint[leg].x + strideLengthX * scalingFactor * (0.5f - t*2.0f);
+						  target.y = -rideHeight;
+						  target.z = footNeutralPoint[leg].z + strideLengthZ * scalingFactor * (0.5f - t*2.0f);
+						  rotation = DegreesToRadians((-0.5f+t*2.0f)*rotationRate)*0.25f;
+						  // The 0.25 gets it into similar units as strides, e.g 100 rotation rate -> ~100mm steps
+					  }
+					  else // Return arc
+					  {
+						  float angle = PI * (t-0.5f)*2.0f; // strideTimer of 0.5-1.0 converted to 0-PI radians
+						  target.x = footNeutralPoint[leg].x - strideLengthX * scalingFactor * 0.5f * cosf(angle);
+						  target.y = -rideHeight + legLiftHeight * sinf(angle);
+						  target.z = footNeutralPoint[leg].z - strideLengthZ * scalingFactor * 0.5f * cosf(angle);
+						  rotation = DegreesToRadians((0.5f - (t-0.5f)*2.0f)*rotationRate * scalingFactor)*0.25f;
+					  }
+				  }
+
+				  // Add rotation offsets about body centre, in sync with steps, matrix is [ cos(θ) −sin(θ) | sin(θ) cos(θ) ]
+				  // Want similar units - degrees per second is about right?
+				  float tempX = target.x;
+				  float tempZ = target.z;
+				  target.x = tempX * cosf(rotation) - tempZ * sinf(rotation);
+				  target.z = tempX * sinf(rotation) + tempZ * cosf(rotation);
+
+				  // Add body pitching
+				  float tempY = target.y;
+				  tempZ = target.z;
+				  float pitch = DegreesToRadians(bodyPitch);
+				  target.y = tempY * cosf(pitch) - tempZ * sinf(pitch);
+				  target.z = tempY * sinf(pitch) + tempZ * cosf(pitch);
+
+				  MoveLeg(leg, target);
+			  }
+
+		  }
 	  }
 
   }
