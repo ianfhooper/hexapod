@@ -308,6 +308,15 @@ float ScaleJoystickValues(uint8_t axis)
 	return scaled;
 }
 
+float Slew(float current, float target, float stepSize)
+{
+	if (current + stepSize > target && current - stepSize < target)
+		return target;
+	if (target > current) current += stepSize;
+	if (target < current) current -= stepSize;
+	return current;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -383,15 +392,17 @@ int main(void)
   float bodyPitch = 0;
   float rideHeight = 80;
 
-  float targetStrideLengthX = 0;
-  float targetStrideLengthZ = 0;
-  float targetRotationRate = 0;
-  float targetBodyPitch = 0;
+  //float targetStrideLengthX = 0;
+  //float targetStrideLengthZ = 0;
+  //float targetRotationRate = 0;
+  //float targetBodyPitch = 0;
 
   float wigglePitch = 0;
   float wiggleRoll = 0;
   float wiggleYaw = 0;
   float wiggleHeight = rideHeight;
+
+  int socTxTimer = 0;
 
   HAL_GPIO_WritePin(GPIOC, SERVO_EN_Pin, GPIO_PIN_SET); // Enable servos
   SetEyeColour(GREEN);
@@ -435,21 +446,6 @@ int main(void)
 		  charReceived = 0;
 	  }
 
-	  if (controller[WALK_TYPE] & WIGGLE_BIT)
-	  {
-		  wigglePitch = ScaleJoystickValues(LEFT_Y)*0.2f; // ±20deg
-		  wiggleRoll = ScaleJoystickValues(LEFT_X)*0.2f;
-		  wiggleYaw = ScaleJoystickValues(RIGHT_X)*0.2f;
-		  wiggleHeight = 100.0f+ScaleJoystickValues(RIGHT_Y)*0.5f;
-	  }
-	  else if (!CALIBRATION_MODE)
-	  {
-		  targetStrideLengthX = ScaleJoystickValues(LEFT_X);
-		  targetStrideLengthZ = ScaleJoystickValues(LEFT_Y);
-		  targetRotationRate = ScaleJoystickValues(RIGHT_X)*0.7f; // This one was a bit strong, needed to scale down somewhat
-		  targetBodyPitch = ScaleJoystickValues(RIGHT_Y) *0.2f; // ±20 degrees
-	  }
-
 	  uint32_t now = HAL_GetTick();
 	  int pollingRate = 20; // Milliseconds per update
 	  if (CALIBRATION_MODE) pollingRate = 200; // 5Hz
@@ -468,6 +464,11 @@ int main(void)
 		  }
 		  else if (controller[WALK_TYPE] & WIGGLE_BIT)
 		  {
+			  wigglePitch = Slew(wigglePitch, ScaleJoystickValues(LEFT_Y)*0.2f, 2.0f); // ±20deg
+			  wiggleRoll = Slew(wiggleRoll, ScaleJoystickValues(LEFT_X)*0.2f, 2.0f);
+			  wiggleYaw = Slew(wiggleYaw, ScaleJoystickValues(RIGHT_X)*0.2f, 2.0f);
+			  wiggleHeight = Slew(wiggleHeight, 100.0f+ScaleJoystickValues(RIGHT_Y)*0.5f, 8.0f);
+
 			  for (int leg = FRONT_LEFT; leg <= FRONT_RIGHT; leg++)
 			  {
 				  Point target;
@@ -496,7 +497,18 @@ int main(void)
 		  }
 		  else
 		  {
-			  // Ramps for stride length
+			  //targetStrideLengthX = ScaleJoystickValues(LEFT_X);
+			  //targetStrideLengthZ = ScaleJoystickValues(LEFT_Y);
+			  //targetRotationRate = ScaleJoystickValues(RIGHT_X)*0.7f; // This one was a bit strong, needed to scale down somewhat
+			  //targetBodyPitch = ScaleJoystickValues(RIGHT_Y) *0.2f; // ±20 degrees
+
+
+			  strideLengthZ = Slew(strideLengthZ, ScaleJoystickValues(LEFT_Y), 4.0f);
+			  strideLengthX = Slew(strideLengthX, ScaleJoystickValues(LEFT_X), 4.0f);
+			  rotationRate = Slew(rotationRate, ScaleJoystickValues(RIGHT_X)*0.8f, 4.0f);
+			  bodyPitch = Slew(bodyPitch, ScaleJoystickValues(RIGHT_Y)*0.2f, 1.0f);
+
+			  /*
 			  float rampRate = 2.0f; // Interplays with polling rate of course
 			  if (targetStrideLengthZ > strideLengthZ) strideLengthZ += rampRate;
 			  if (targetStrideLengthZ < strideLengthZ) strideLengthZ -= rampRate;
@@ -506,7 +518,7 @@ int main(void)
 			  if (targetRotationRate > rotationRate) rotationRate += rampRate;
 			  if (targetBodyPitch < bodyPitch) bodyPitch -= rampRate;
 			  if (targetBodyPitch > bodyPitch) bodyPitch += rampRate;
-
+			  */
 
 			  float legLiftHeight = sqrtf(strideLengthX*strideLengthX+strideLengthZ*strideLengthZ+rotationRate*rotationRate);
 			  if (legLiftHeight > 50) legLiftHeight = 50;
@@ -624,9 +636,11 @@ int main(void)
 
 		  }
 
-		  // Read pack voltage and transmit back to controller
-		  if (!CALIBRATION_MODE)
+		  // Read pack voltage and transmit back to controller at 1Hz
+		  if (++socTxTimer >= 1000/pollingRate && !CALIBRATION_MODE)
 		  {
+			  socTxTimer = 0;
+
 			  HAL_ADC_Start(&hadc1);
 			  if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK)
 			  {
