@@ -288,11 +288,21 @@ void MoveLeg(uint8_t leg, Point target) // leg is enum 0-5, target is absolute c
 	float linearDistanceToFoot = sqrtf(shadowLength*shadowLength + y*y);
 	float angleOfElevationToFoot = atanf(y/shadowLength);
 
-	// Law of cosines: angle = acosf( ( a^2 + b^2 - c^2) / 2ab )
-	// where a and b are adjacent sides to angle, c is opposite
-	float insideAngle = acosf((THIGH_LENGTH*THIGH_LENGTH + linearDistanceToFoot*linearDistanceToFoot - CALF_LENGTH*CALF_LENGTH) / (2*THIGH_LENGTH*linearDistanceToFoot));
-	float hipAngle = angleOfElevationToFoot + insideAngle;
-	float kneeAngle = PI - acosf((THIGH_LENGTH*THIGH_LENGTH + CALF_LENGTH*CALF_LENGTH - linearDistanceToFoot*linearDistanceToFoot) / (2*THIGH_LENGTH*CALF_LENGTH));
+	float hipAngle, kneeAngle;
+	if (linearDistanceToFoot > CALF_LENGTH + THIGH_LENGTH)
+	{
+		// Too far! Just do straight leg pointing at target (IK would flip out)
+		hipAngle = angleOfElevationToFoot;
+		kneeAngle = 0;
+	}
+	else // Target is within reach
+	{
+		// Law of cosines: angle = acosf( ( a^2 + b^2 - c^2) / 2ab )
+		// where a and b are adjacent sides to angle, c is opposite
+		float insideAngle = acosf((THIGH_LENGTH*THIGH_LENGTH + linearDistanceToFoot*linearDistanceToFoot - CALF_LENGTH*CALF_LENGTH) / (2*THIGH_LENGTH*linearDistanceToFoot));
+		hipAngle = angleOfElevationToFoot + insideAngle;
+		kneeAngle = PI - acosf((THIGH_LENGTH*THIGH_LENGTH + CALF_LENGTH*CALF_LENGTH - linearDistanceToFoot*linearDistanceToFoot) / (2*THIGH_LENGTH*CALF_LENGTH));
+	}
 
 	// Send angles to servos
 	MoveServo(leg*3+1, RadiansToDegrees(yaw), 0);
